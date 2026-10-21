@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: unittest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run the unit test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Smoke-test the demo Takeout set
+        run: |
+          python examples/make_demo_takeout.py
+          # The demo set deliberately misses part 002: audit must exit 1
+          # and say why.
+          python takeout_audit.py audit examples/takeout-demo/*.zip > /tmp/audit.txt || test $? -eq 1
+          grep -q "missing archive part" /tmp/audit.txt
+          grep -q "missing sidecar" /tmp/audit.txt && exit 1 || true
+          python takeout_audit.py extract examples/takeout-demo/*.zip -o /tmp/library
+          test -f "/tmp/library/Google Photos/IMG_0001.jpg.json"
