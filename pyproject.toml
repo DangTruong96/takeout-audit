@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "takeout-audit"
+version = "0.1.0"
+description = "Offline auditor for Google Takeout archive sets: integrity, part completeness, duplicate detection, Photos sidecar pairing, and unified deduplicated extraction."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "DangTruong96" },
+]
+keywords = ["google-takeout", "backup", "data-liberation", "self-hosted", "dedupe", "privacy"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+takeout-audit = "takeout_audit:main"
+
+[project.urls]
+Homepage = "https://github.com/DangTruong96/takeout-audit"
+
+[tool.setuptools]
+py-modules = ["takeout_audit"]
