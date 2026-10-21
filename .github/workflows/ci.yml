@@ -31,6 +31,6 @@ jobs:
           # and say why.
           python takeout_audit.py audit examples/takeout-demo/*.zip > /tmp/audit.txt || test $? -eq 1
           grep -q "missing archive part" /tmp/audit.txt
-          grep -q "missing sidecar" /tmp/audit.txt && exit 1 || true
+          grep -q "without a metadata sidecar" /tmp/audit.txt && exit 1 || true
           python takeout_audit.py extract examples/takeout-demo/*.zip -o /tmp/library
           test -f "/tmp/library/Google Photos/IMG_0001.jpg.json"
