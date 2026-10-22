@@ -8,7 +8,8 @@ delete your Google account or cancel Google One — this tool answers, fully
 offline and without extracting anything:
 
   1. Is every archive part present, and is every archive intact?
-  2. What is actually in the set (per service, file counts, sizes)?
+  2. What is actually in the set (per service, file counts, sizes) —
+     including how many messages are in your Mail mbox archives?
   3. How much content is duplicated across parts and across successive
      exports, and how much space is that wasting?
   4. Is every Google Photos media file matched by its metadata sidecar,
@@ -38,7 +39,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 MEDIA_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".bmp",
@@ -115,6 +116,8 @@ class Report:
     photos_media: int = 0
     photos_missing_sidecar: list = field(default_factory=list)
     photos_orphan_sidecars: list = field(default_factory=list)
+    mail_mbox_files: list = field(default_factory=list)  # {source, path, messages}
+    mail_messages: int = 0
     hash_mode: str = "crc32"
 
     @property
@@ -179,6 +182,10 @@ class Report:
                 "media_files": self.photos_media,
                 "missing_sidecar": self.photos_missing_sidecar,
                 "orphan_sidecars": self.photos_orphan_sidecars,
+            },
+            "mail": {
+                "mbox_files": self.mail_mbox_files,
+                "total_messages": self.mail_messages,
             },
             "problems": self.problems,
             "warnings": self.warnings,
@@ -352,6 +359,30 @@ def content_key(entry: Entry, openers, mode: str) -> str:
     return f"{entry.size}:{entry.digest}"
 
 
+def _iter_lines(entry: Entry, openers):
+    """Yield the entry's content as lines (bytes, newline stripped),
+    streaming chunk by chunk so huge files are never held in memory."""
+    buf = b""
+    for chunk in _entry_chunks(entry, openers):
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            yield line.rstrip(b"\r")
+    if buf:
+        yield buf.rstrip(b"\r")
+
+
+def count_mbox_messages(entry: Entry, openers) -> int:
+    """Count messages in an mbox entry. In mbox format every message is
+    introduced by a separator line beginning with ``From ``; body lines
+    that would look like separators are escaped as ``>From `` by the
+    writer, so a plain prefix count is the standard heuristic."""
+    return sum(
+        1 for line in _iter_lines(entry, openers)
+        if line.startswith(b"From ")
+    )
+
+
 # --------------------------------------------------------------------------
 # Audit
 # --------------------------------------------------------------------------
@@ -400,6 +431,17 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
         svc["bytes"] += e.size
         ext = PurePosixPath(e.path).suffix.lower() or "(none)"
         report.extensions[ext] = report.extensions.get(ext, 0) + 1
+
+    # Mail deep check: count messages in every .mbox in the set. The
+    # content is streamed line by line; nothing is stored.
+    for e in entries:
+        if e.path.lower().endswith(".mbox"):
+            count = count_mbox_messages(e, openers)
+            report.mail_mbox_files.append(
+                {"source": e.source, "path": e.path, "messages": count}
+            )
+            report.mail_messages += count
+    report.mail_mbox_files.sort(key=lambda m: -m["messages"])
 
     # Duplicates: group by size first; hash only collisions.
     by_size: dict[int, list[Entry]] = {}
@@ -574,6 +616,17 @@ def render_text(report: Report, max_samples: int = 10) -> str:
     for p in report.photos_orphan_sidecars[:max_samples]:
         lines.append(f"  orphan sidecar : {p}")
     lines.append("")
+    if report.mail_mbox_files:
+        lines.append(
+            f"Mail: {report.mail_messages} message(s) in "
+            f"{len(report.mail_mbox_files)} mbox file(s)"
+        )
+        for m in report.mail_mbox_files[:max_samples]:
+            lines.append(
+                f"  mbox: {m['source']}:{m['path']} — "
+                f"{m['messages']} message(s)"
+            )
+        lines.append("")
     for prob in report.problems:
         lines.append(f"PROBLEM: {prob}")
     for warn in report.warnings:

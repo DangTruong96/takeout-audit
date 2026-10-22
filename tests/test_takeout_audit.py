@@ -113,6 +113,78 @@ class Fixture(unittest.TestCase):
         self.assertEqual(report.duplicate_files, 1)
 
 
+THREE_MESSAGE_MBOX = (
+    b"From alice@example.com Mon Jan  5 10:00:00 2026\n"
+    b"Subject: one\n\nfirst body\n"
+    b"From bob@example.com Mon Jan  5 11:00:00 2026\n"
+    b"Subject: two\n\n"
+    b">From a line in the body, escaped, not a separator\n"
+    b"Fromage is not a separator either\n"
+    b"From carol@example.com Mon Jan  5 12:00:00 2026\n"
+    b"Subject: three\n\nthird body"  # no trailing newline, on purpose
+)
+
+
+class MailCounts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fixture_mbox_counted(self):
+        part1 = self.dir / "takeout-20260101T120000Z-001.zip"
+        write_zip(part1, {
+            "Takeout/Mail/All mail Including Spam and Trash.mbox": MBOX,
+        })
+        report = ta.audit_sources([part1])
+        self.assertEqual(report.mail_messages, 1)
+        self.assertEqual(len(report.mail_mbox_files), 1)
+        entry = report.mail_mbox_files[0]
+        self.assertEqual(entry["messages"], 1)
+        self.assertEqual(
+            entry["path"],
+            "Takeout/Mail/All mail Including Spam and Trash.mbox",
+        )
+
+    def test_multiple_messages_and_escapes(self):
+        arc = self.dir / "takeout-mail.zip"
+        write_zip(arc, {
+            "Takeout/Mail/inbox.mbox": THREE_MESSAGE_MBOX,
+            "Takeout/Mail/empty.mbox": b"",
+        })
+        report = ta.audit_sources([arc])
+        self.assertEqual(report.mail_messages, 3)
+        counts = {m["path"]: m["messages"] for m in report.mail_mbox_files}
+        self.assertEqual(counts["Takeout/Mail/inbox.mbox"], 3)
+        self.assertEqual(counts["Takeout/Mail/empty.mbox"], 0)
+
+    def test_mbox_in_directory_source(self):
+        root = self.dir / "extracted"
+        (root / "Takeout" / "Mail").mkdir(parents=True)
+        (root / "Takeout" / "Mail" / "inbox.mbox").write_bytes(
+            THREE_MESSAGE_MBOX
+        )
+        report = ta.audit_sources([root])
+        self.assertEqual(report.mail_messages, 3)
+
+    def test_non_mbox_files_not_counted(self):
+        arc = self.dir / "takeout-nomail.zip"
+        write_zip(arc, {"Takeout/Drive/readme.txt": REPORT})
+        report = ta.audit_sources([arc])
+        self.assertEqual(report.mail_messages, 0)
+        self.assertEqual(report.mail_mbox_files, [])
+
+    def test_mail_section_in_json_dict(self):
+        arc = self.dir / "takeout-json.zip"
+        write_zip(arc, {"Takeout/Mail/inbox.mbox": THREE_MESSAGE_MBOX})
+        data = ta.audit_sources([arc]).to_dict()
+        self.assertEqual(data["mail"]["total_messages"], 3)
+        self.assertEqual(len(data["mail"]["mbox_files"]), 1)
+        self.assertEqual(data["version"], "0.2.0")
+
+
 class CliSmoke(unittest.TestCase):
     """End-to-end: run the CLI as a subprocess on realistic fixtures."""
 

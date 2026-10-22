@@ -46,6 +46,7 @@ Takeout Audit is that audit step.
 | **Inventory** | File counts and sizes per Google service and per file type |
 | **Duplicates** | Identical content across parts and across successive exports, with wasted space |
 | **Photos sidecar pairing** | Media files whose metadata `.json` is missing *anywhere in the set*, and orphan sidecars with no media |
+| **Mail deep check** | Message counts for every `.mbox` in the set (counted by streaming, content never stored) |
 | **Unified extract** | One folder tree with duplicates removed and a JSON log of every skip |
 
 ## Install
@@ -105,6 +106,9 @@ Duplicates: 1 group(s), 1 redundant file(s), 276 B wasted
 
 Google Photos: 1 media file(s), 0 missing sidecar, 0 orphan sidecar(s)
 
+Mail: 1 message(s) in 1 mbox file(s)
+  mbox: takeout-20260101T120000Z-001.zip:Takeout/Mail/All mail Including Spam and Trash.mbox — 1 message(s)
+
 PROBLEM: missing archive part(s) for takeout-20260101T120000Z: 002
 Warning: 1 duplicated file(s), 276 B wasted
 Result: PROBLEMS found (see above).
@@ -148,8 +152,8 @@ tar inputs are always hashed by streaming their content once.
 
 ## Roadmap
 
-- v0.2: per-service deep checks (mbox message counts, YouTube history
-  parsing), HTML report.
+- v0.2: per-service deep checks — mbox message counts shipped in 0.2.0;
+  YouTube history parsing and an HTML report are still to come.
 - v0.3: compare two audit reports ("what changed between my 2025 and 2026
   exports?").
 

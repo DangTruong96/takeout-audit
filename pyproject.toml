@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "takeout-audit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline auditor for Google Takeout archive sets: integrity, part completeness, duplicate detection, Photos sidecar pairing, and unified deduplicated extraction."
 readme = "README.md"
 license = { text = "MIT" }
