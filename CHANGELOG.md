@@ -4,6 +4,43 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] — 2026-10-23
+
+### Fixed
+- Archives that contain several members with the SAME path (legal in
+  both zip and tar) were read by name, which resolves to just one of
+  them. Under `--sha256` every same-named member hashed the last
+  member's bytes, so different files were reported as duplicates of
+  each other; `extract` wrote the wrong member's content. Members are
+  now addressed by their position in the archive listing.
+- `extract` silently overwrote a file when a later entry mapped to an
+  output path that was already written (repeated member names, merged
+  exports), while the log claimed both had been written. The later
+  entry is now skipped with the reason recorded in the log.
+- A file literally named `Takeout` at an archive root vanished from
+  the extract log entirely (neither written nor skipped). It is now
+  recorded as skipped, with the reason.
+- Photos sidecar pairing compared names byte-wise, so a media file
+  stored with an NFC name and its sidecar stored NFD (or vice versa —
+  typical for sets zipped on macOS) was reported as both "missing
+  sidecar" and "orphan sidecar". Pairing comparisons now run on
+  NFC-normalized names; reported paths stay as stored.
+
+### Performance
+- Mail message counting is now a streaming scan that only tracks
+  line starts: O(n) time and O(chunk) memory regardless of line
+  lengths. The previous line-splitting counter copied the remaining
+  buffer for every line and was quadratic — a plain 30 MB mbox took
+  over a minute (≈0.5 MB/s); it now processes at tens of MB/s, and a
+  150 MB mbox consisting of a single line takes well under a second
+  instead of a minute.
+
+### Tests
+- Eight new adversarial tests (duplicate member names in zip and tar,
+  extract path collisions, Unicode-normalized sidecar pairing, mail
+  separators split across chunk boundaries, extract accounting).
+  Suite is now 36 tests.
+
 ## [0.2.1] — 2026-10-23
 
 ### Fixed

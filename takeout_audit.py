@@ -34,12 +34,13 @@ import os
 import re
 import sys
 import tarfile
+import unicodedata
 import zipfile
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 MEDIA_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".bmp",
@@ -74,6 +75,11 @@ class Entry:
     kind: str            # "zip" | "tar" | "dir"
     crc: int | None = None        # CRC-32 from zip metadata, if any
     digest: str | None = None     # content hash, computed on demand
+    # Position of this entry within its archive's member list. Needed
+    # because an archive may contain several members with the SAME path
+    # (legal in both zip and tar): opening a member by name resolves to
+    # just one of them, so content reads must address the exact member.
+    index: int | None = None
 
     @property
     def service(self) -> str:
@@ -225,7 +231,7 @@ def _iter_zip(path: Path, label: str, arc: ArchiveReport) -> list[Entry]:
         if bad is not None:
             arc.ok = False
             arc.error = f"corrupt entry (CRC check failed): {bad}"
-        for info in zf.infolist():
+        for idx, info in enumerate(zf.infolist()):
             if info.is_dir():
                 continue
             entries.append(
@@ -235,6 +241,7 @@ def _iter_zip(path: Path, label: str, arc: ArchiveReport) -> list[Entry]:
                     size=info.file_size,
                     kind="zip",
                     crc=info.CRC,
+                    index=idx,
                 )
             )
     arc.entries = len(entries)
@@ -251,7 +258,7 @@ def _iter_tar(path: Path, label: str, arc: ArchiveReport) -> list[Entry]:
         return entries
     with tf:
         try:
-            for member in tf:
+            for idx, member in enumerate(tf):
                 if not member.isfile():
                     continue
                 entries.append(
@@ -260,6 +267,7 @@ def _iter_tar(path: Path, label: str, arc: ArchiveReport) -> list[Entry]:
                         path=member.name.replace(os.sep, "/"),
                         size=member.size,
                         kind="tar",
+                        index=idx,
                     )
                 )
         except (tarfile.TarError, EOFError, OSError, zlib.error) as exc:
@@ -368,7 +376,14 @@ def _entry_chunks(entry: Entry, openers):
     kind, base = openers[entry.source]
     if kind == "zip":
         with zipfile.ZipFile(base) as zf:
-            with zf.open(entry.path) as fh:
+            # Address the exact member by position: a zip may legally
+            # hold several entries with the same name, and opening by
+            # name silently returns the last one for all of them.
+            target = (
+                zf.infolist()[entry.index]
+                if entry.index is not None else entry.path
+            )
+            with zf.open(target) as fh:
                 while True:
                     chunk = fh.read(CHUNK)
                     if not chunk:
@@ -376,8 +391,17 @@ def _entry_chunks(entry: Entry, openers):
                     yield chunk
     elif kind == "tar":
         with tarfile.open(base, "r:*") as tf:
-            member = tf.getmember(entry.path)
+            # Same duplicate-name hazard as zip: getmember() returns
+            # one match, so address the member by position instead.
+            member = (
+                tf.getmembers()[entry.index]
+                if entry.index is not None else tf.getmember(entry.path)
+            )
             fh = tf.extractfile(member)
+            if fh is None:
+                raise tarfile.TarError(
+                    f"entry has no readable content: {entry.path}"
+                )
             while True:
                 chunk = fh.read(CHUNK)
                 if not chunk:
@@ -402,28 +426,45 @@ def content_key(entry: Entry, openers, mode: str) -> str:
     return f"{entry.size}:{entry.digest}"
 
 
-def _iter_lines(entry: Entry, openers):
-    """Yield the entry's content as lines (bytes, newline stripped),
-    streaming chunk by chunk so huge files are never held in memory."""
-    buf = b""
-    for chunk in _entry_chunks(entry, openers):
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            yield line.rstrip(b"\r")
-    if buf:
-        yield buf.rstrip(b"\r")
-
-
 def count_mbox_messages(entry: Entry, openers) -> int:
     """Count messages in an mbox entry. In mbox format every message is
     introduced by a separator line beginning with ``From ``; body lines
     that would look like separators are escaped as ``>From `` by the
-    writer, so a plain prefix count is the standard heuristic."""
-    return sum(
-        1 for line in _iter_lines(entry, openers)
-        if line.startswith(b"From ")
-    )
+    writer, so a plain prefix count is the standard heuristic.
+
+    The scan is a small state machine over the raw chunks — O(n) time
+    and O(chunk) memory regardless of line lengths. Splitting the
+    stream into lines first (the previous implementation) copies the
+    remaining buffer for every line, which is quadratic: a plain
+    30 MB mbox took over a minute, and a file with very long lines
+    degraded just as badly.
+    """
+    separator = b"From "
+    count = 0
+    pending = b""      # partial separator candidate at a line start
+    at_line_start = True
+    for chunk in _entry_chunks(entry, openers):
+        data = pending + chunk
+        pending = b""
+        pos = 0
+        end = len(data)
+        while pos < end:
+            if at_line_start:
+                if end - pos < len(separator):
+                    # Too few bytes left to decide: carry them over.
+                    pending = data[pos:]
+                    pos = end
+                    break
+                if data.startswith(separator, pos):
+                    count += 1
+                at_line_start = False
+            newline = data.find(b"\n", pos)
+            if newline < 0:
+                pos = end
+            else:
+                pos = newline + 1
+                at_line_start = True
+    return count
 
 
 # --------------------------------------------------------------------------
@@ -447,6 +488,14 @@ def _check_parts(paths: list[Path]) -> dict:
         if gone:
             missing[prefix] = gone
     return missing
+
+
+def _nfc(text: str) -> str:
+    """NFC-normalize a path for COMPARISON purposes. The same file name
+    can be stored NFC in one part and NFD in another (typically when a
+    set was zipped on macOS), and byte-wise comparison would then
+    report a sidecar as both missing and orphaned."""
+    return unicodedata.normalize("NFC", text)
 
 
 def _sidecar_candidates(media_name: str) -> list[str]:
@@ -525,9 +574,12 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
     report.duplicate_groups.sort(key=lambda g: -g["size"] * (g["copies"] - 1))
 
     # Photos sidecar pairing (across the whole set, same folder).
+    # All comparisons run on NFC-normalized paths (reported paths stay
+    # as stored): the same name may be NFC in one part and NFD in
+    # another, which must not read as "sidecar missing AND orphaned".
     photos = [e for e in entries if e.service == "Google Photos"]
     sidecar_paths = {
-        e.path for e in photos if e.name.lower().endswith(SIDECAR_SUFFIX)
+        _nfc(e.path) for e in photos if e.name.lower().endswith(SIDECAR_SUFFIX)
     }
     media_paths = set()
     for e in photos:
@@ -535,9 +587,10 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
         if ext in MEDIA_EXTENSIONS:
             report.photos_media += 1
             media_paths.add(e.path)
-            folder = str(PurePosixPath(e.path).parent)
+            folder = _nfc(str(PurePosixPath(e.path).parent))
             found = False
             for cand in _sidecar_candidates(e.name):
+                cand = _nfc(cand)
                 want = f"{folder}/{cand}" if folder != "." else cand
                 if want in sidecar_paths:
                     found = True
@@ -552,16 +605,16 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
     trunc_stem_len = SIDECAR_MAX_BASENAME - len(SIDECAR_SUFFIX)
     for mp in media_paths:
         ppath = PurePosixPath(mp)
-        mfolder = str(ppath.parent)
-        media_by_folder.setdefault(mfolder, set()).add(ppath.name)
+        mfolder = _nfc(str(ppath.parent))
+        media_by_folder.setdefault(mfolder, set()).add(_nfc(ppath.name))
         trunc_prefix_by_folder.setdefault(mfolder, set()).add(
-            (ppath.name + SIDECAR_SUFFIX)[:trunc_stem_len]
+            _nfc(ppath.name + SIDECAR_SUFFIX)[:trunc_stem_len]
         )
     for e in photos:
         if not e.name.lower().endswith(SIDECAR_SUFFIX):
             continue
-        folder = str(PurePosixPath(e.path).parent)
-        stem = e.name[: -len(SIDECAR_SUFFIX)]
+        folder = _nfc(str(PurePosixPath(e.path).parent))
+        stem = _nfc(e.name[: -len(SIDECAR_SUFFIX)])
         paired = stem in media_by_folder.get(folder, set()) or (
             len(stem) == trunc_stem_len
             and stem in trunc_prefix_by_folder.get(folder, set())
@@ -585,6 +638,7 @@ def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> di
     entries, archives, openers = load_sources(paths)
     mode = "sha256" if sha256 else "crc32"
     seen: dict[str, str] = {}
+    written_dests: dict[str, str] = {}   # output-relative path -> entry path
     written, skipped = [], []
     read_problems: list[dict] = []
     for e in entries:
@@ -602,7 +656,22 @@ def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> di
             if "Takeout" in parts:
                 rel = PurePosixPath(*parts[parts.index("Takeout") + 1:])
                 if not rel.parts:
+                    skipped.append(
+                        {"path": e.path,
+                         "reason": "path maps to the library root, skipped"}
+                    )
                     continue
+            if rel.as_posix() in written_dests:
+                # A different file already claimed this output path
+                # (archives may repeat a name, and exports get merged).
+                # Overwriting it would silently destroy the first copy
+                # while the log claimed both were written.
+                skipped.append(
+                    {"path": e.path,
+                     "reason": "output path already written from "
+                               f"{written_dests[rel.as_posix()]}, skipped"}
+                )
+                continue
             dest = output.joinpath(*rel.parts)
             dest.parent.mkdir(parents=True, exist_ok=True)
             with open(dest, "wb") as out:
@@ -621,6 +690,7 @@ def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> di
             )
             continue
         seen[key] = e.path
+        written_dests[rel.as_posix()] = e.path
         written.append(e.path)
     log = {
         "version": __version__,

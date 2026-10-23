@@ -182,7 +182,7 @@ class MailCounts(unittest.TestCase):
         data = ta.audit_sources([arc]).to_dict()
         self.assertEqual(data["mail"]["total_messages"], 3)
         self.assertEqual(len(data["mail"]["mbox_files"]), 1)
-        self.assertEqual(data["version"], "0.2.1")
+        self.assertEqual(data["version"], "0.2.2")
 
 
 class CliSmoke(unittest.TestCase):
