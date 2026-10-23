@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-10-23
+
+### Fixed
+- Sources that share a file/folder name (e.g. two extracted exports
+  both called `Takeout`, or two parts with the same name in different
+  folders) no longer have their contents read through each other. The
+  later source used to shadow the earlier one, so Mail counts came from
+  the wrong mailbox and different same-size files were reported as
+  duplicates. Same-named sources are now labelled by full path and read
+  independently.
+- Corrupt or truncated archives no longer crash with a traceback: a zip
+  entry with a bad CRC is reported as an archive problem (the Mail check
+  and content hashing skip unreadable entries), a truncated tar is
+  flagged the same way, and `extract` skips unreadable entries — logged,
+  with no partial file left behind.
+- I/O errors honour the documented exit-code contract again: `--json`
+  pointing into a directory that does not exist, or `extract -o`
+  naming an existing regular file, now exit 2 with a one-line error
+  instead of an unhandled traceback.
+- Auditing sources that contain no files at all now warns ("no files
+  found in any source") instead of reporting a clean result.
+
+### Performance
+- Photos sidecar pairing is indexed by folder instead of scanning every
+  media path for every sidecar (was quadratic). A synthetic 3,000-photo
+  set that took ~2m52s now audits in ~9s.
+
+### Tests
+- Eight new regression tests covering all of the above; suite is now
+  28 tests.
+
 ## [0.2.0] — 2026-10-23
 
 ### Added

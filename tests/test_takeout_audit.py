@@ -182,7 +182,7 @@ class MailCounts(unittest.TestCase):
         data = ta.audit_sources([arc]).to_dict()
         self.assertEqual(data["mail"]["total_messages"], 3)
         self.assertEqual(len(data["mail"]["mbox_files"]), 1)
-        self.assertEqual(data["version"], "0.2.0")
+        self.assertEqual(data["version"], "0.2.1")
 
 
 class CliSmoke(unittest.TestCase):
@@ -277,6 +277,163 @@ class CliSmoke(unittest.TestCase):
         proc = self.run_cli("--help")
         self.assertEqual(proc.returncode, 0)
         self.assertIn("audit", proc.stdout)
+
+
+class SameBasenameSources(unittest.TestCase):
+    """Regression: two sources with the same file/folder name (two
+    extracted exports are both called "Takeout") must never have their
+    contents read through each other."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_export(self, parent: Path, tag: bytes, mbox: bytes) -> Path:
+        root = parent / "Takeout"
+        (root / "Drive").mkdir(parents=True)
+        (root / "Mail").mkdir(parents=True)
+        (root / "Drive" / "same.txt").write_bytes(tag + b"x" * 100)
+        (root / "Mail" / "inbox.mbox").write_bytes(mbox)
+        return root
+
+    def test_same_name_directories_keep_their_own_content(self):
+        old = self._make_export(
+            self.dir / "2024", b"OLD-",
+            b"From a@x\nSubject: old\n\nbody\n",
+        )
+        new = self._make_export(self.dir / "2026", b"NEW-", THREE_MESSAGE_MBOX)
+        report = ta.audit_sources([old, new])
+        # Different same-size contents are NOT duplicates...
+        self.assertEqual(report.duplicate_files, 0)
+        # ...each mbox is counted from its own directory (1 + 3)...
+        self.assertEqual(report.mail_messages, 4)
+        # ...and the report can tell the two sources apart.
+        labels = {a.source for a in report.archives}
+        self.assertEqual(len(labels), 2)
+
+    def test_same_name_zips_with_sha256(self):
+        (self.dir / "a").mkdir()
+        (self.dir / "b").mkdir()
+        write_zip(self.dir / "a" / "takeout-p.zip",
+                  {"Takeout/Drive/f.txt": b"A" * 50})
+        write_zip(self.dir / "b" / "takeout-p.zip",
+                  {"Takeout/Drive/f.txt": b"B" * 50})
+        report = ta.audit_sources(
+            [self.dir / "a" / "takeout-p.zip",
+             self.dir / "b" / "takeout-p.zip"],
+            sha256=True,
+        )
+        self.assertEqual(report.duplicate_files, 0)
+
+
+class CorruptContentDoesNotCrash(unittest.TestCase):
+    """Regression: corrupt/truncated archives are the tool's home turf —
+    they must be reported as problems, never crash with a traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_corrupt_zip_entry_flagged_not_fatal(self):
+        path = self.dir / "takeout-corrupt.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("Takeout/Mail/inbox.mbox", THREE_MESSAGE_MBOX)
+            zf.writestr("Takeout/Drive/ok.txt", b"fine content")
+        raw = bytearray(path.read_bytes())
+        i = raw.find(b"From alice@example.com")
+        raw[i + 12] ^= 0xFF  # break the mbox entry's CRC
+        path.write_bytes(bytes(raw))
+        report = ta.audit_sources([path])
+        self.assertFalse(report.archives[0].ok)
+        self.assertTrue(report.problems)
+        # The unreadable mbox is not silently counted.
+        self.assertEqual(report.mail_mbox_files, [])
+
+    def test_truncated_tgz_flagged_not_fatal(self):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for name in ("Takeout/Drive/a.txt", "Takeout/Drive/b.txt"):
+                data = b"z" * 5000
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        path = self.dir / "takeout-trunc.tgz"
+        blob = buf.getvalue()
+        path.write_bytes(blob[: len(blob) // 2])
+        report = ta.audit_sources([path])
+        self.assertFalse(report.archives[0].ok)
+        self.assertTrue(report.problems)
+
+
+class CliErrorHandling(unittest.TestCase):
+    """Regression: I/O errors are exit 2 with a message, per the README's
+    exit-code contract — not an unhandled traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.script = Path(__file__).resolve().parent.parent / "takeout_audit.py"
+        self.src = self.dir / "src"
+        (self.src / "Takeout" / "Drive").mkdir(parents=True)
+        (self.src / "Takeout" / "Drive" / "a.txt").write_bytes(b"hello")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(self.script), *args],
+            capture_output=True, text=True,
+        )
+
+    def test_json_into_missing_directory_is_exit_2(self):
+        proc = self.run_cli("audit", str(self.src), "--json",
+                            str(self.dir / "nope" / "report.json"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_extract_output_existing_file_is_exit_2(self):
+        target = self.dir / "afile"
+        target.write_text("x")
+        proc = self.run_cli("extract", str(self.src), "-o", str(target))
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_empty_directory_warns_instead_of_clean(self):
+        empty = self.dir / "empty"
+        empty.mkdir()
+        proc = self.run_cli("audit", str(empty))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("no files found", proc.stdout)
+        strict = self.run_cli("audit", str(empty), "--strict")
+        self.assertEqual(strict.returncode, 1)
+
+
+class SidecarPairingAtScale(unittest.TestCase):
+    """Regression: pairing used to scan every media path for every
+    sidecar (quadratic). 1,200 pairs must pair up correctly — and the
+    suite's runtime shows the fix (this took minutes at 3,000 pairs)."""
+
+    def test_many_photos_pair_correctly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            photos = Path(tmp) / "Takeout" / "Google Photos"
+            photos.mkdir(parents=True)
+            n = 1200
+            for i in range(n):
+                (photos / f"IMG_{i:05d}.jpg").write_bytes(b"\xff\xd8data")
+                (photos / f"IMG_{i:05d}.jpg.json").write_bytes(b"{}")
+            (photos / "IMG_lonely.jpg").write_bytes(b"\xff\xd8data")
+            (photos / "IMG_ghost.jpg.json").write_bytes(b"{}")
+            report = ta.audit_sources([Path(tmp)])
+            self.assertEqual(report.photos_media, n + 1)
+            self.assertEqual(len(report.photos_missing_sidecar), 1)
+            self.assertEqual(len(report.photos_orphan_sidecars), 1)
 
 
 if __name__ == "__main__":

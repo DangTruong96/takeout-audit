@@ -39,7 +39,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 MEDIA_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".bmp",
@@ -119,6 +119,7 @@ class Report:
     mail_mbox_files: list = field(default_factory=list)  # {source, path, messages}
     mail_messages: int = 0
     hash_mode: str = "crc32"
+    empty: bool = False           # no files found in any source
 
     @property
     def problems(self) -> list[str]:
@@ -134,6 +135,10 @@ class Report:
     @property
     def warnings(self) -> list[str]:
         out = []
+        if self.empty:
+            out.append(
+                "no files found in any source — check the paths you passed"
+            )
         if self.duplicate_files:
             out.append(
                 f"{self.duplicate_files} duplicated file(s), "
@@ -207,7 +212,7 @@ def _classify(path: Path) -> str | None:
     return None
 
 
-def _iter_zip(path: Path, arc: ArchiveReport) -> list[Entry]:
+def _iter_zip(path: Path, label: str, arc: ArchiveReport) -> list[Entry]:
     entries: list[Entry] = []
     try:
         zf = zipfile.ZipFile(path)
@@ -225,7 +230,7 @@ def _iter_zip(path: Path, arc: ArchiveReport) -> list[Entry]:
                 continue
             entries.append(
                 Entry(
-                    source=path.name,
+                    source=label,
                     path=info.filename.replace(os.sep, "/"),
                     size=info.file_size,
                     kind="zip",
@@ -236,31 +241,38 @@ def _iter_zip(path: Path, arc: ArchiveReport) -> list[Entry]:
     return entries
 
 
-def _iter_tar(path: Path, arc: ArchiveReport) -> list[Entry]:
+def _iter_tar(path: Path, label: str, arc: ArchiveReport) -> list[Entry]:
     entries: list[Entry] = []
     try:
         tf = tarfile.open(path, "r:*")
-    except tarfile.TarError as exc:
+    except (tarfile.TarError, EOFError, OSError) as exc:
         arc.ok = False
         arc.error = f"not a readable tar archive ({exc})"
         return entries
     with tf:
-        for member in tf:
-            if not member.isfile():
-                continue
-            entries.append(
-                Entry(
-                    source=path.name,
-                    path=member.name.replace(os.sep, "/"),
-                    size=member.size,
-                    kind="tar",
+        try:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                entries.append(
+                    Entry(
+                        source=label,
+                        path=member.name.replace(os.sep, "/"),
+                        size=member.size,
+                        kind="tar",
+                    )
                 )
-            )
+        except (tarfile.TarError, EOFError, OSError, zlib.error) as exc:
+            # A truncated download fails mid-iteration, not at open time.
+            # Keep the members listed so far and report the problem
+            # instead of crashing.
+            arc.ok = False
+            arc.error = f"corrupt or truncated tar archive ({exc})"
     arc.entries = len(entries)
     return entries
 
 
-def _iter_dir(path: Path, arc: ArchiveReport) -> list[Entry]:
+def _iter_dir(path: Path, label: str, arc: ArchiveReport) -> list[Entry]:
     entries: list[Entry] = []
     for root, _dirs, files in os.walk(path):
         for fname in files:
@@ -271,10 +283,22 @@ def _iter_dir(path: Path, arc: ArchiveReport) -> list[Entry]:
             except OSError:
                 continue
             entries.append(
-                Entry(source=path.name, path=rel, size=size, kind="dir")
+                Entry(source=label, path=rel, size=size, kind="dir")
             )
     arc.entries = len(entries)
     return entries
+
+
+def _source_labels(paths: list[Path]) -> list[str]:
+    """A unique display/lookup label per source. The plain file or folder
+    name is used unless two sources share it — extracted exports are very
+    often both called ``Takeout`` — in which case the full path is used
+    so the sources stay distinguishable and, critically, so content
+    lookups never open one source's files through another's."""
+    counts: dict[str, int] = {}
+    for p in paths:
+        counts[p.name] = counts.get(p.name, 0) + 1
+    return [str(p) if counts[p.name] > 1 else p.name for p in paths]
 
 
 def load_sources(paths: list[Path]):
@@ -283,26 +307,45 @@ def load_sources(paths: list[Path]):
     archives: list[ArchiveReport] = []
     openers: dict[str, object] = {}
 
-    for path in paths:
+    for path, label in zip(paths, _source_labels(paths)):
         kind = _classify(path)
         if kind is None:
             raise ValueError(
                 f"unsupported source (expected .zip, .tgz/.tar.gz or a "
                 f"directory): {path}"
             )
-        arc = ArchiveReport(source=path.name, kind=kind)
+        arc = ArchiveReport(source=label, kind=kind)
         if kind == "zip":
-            found = _iter_zip(path, arc)
-            openers[path.name] = ("zip", path)
+            found = _iter_zip(path, label, arc)
         elif kind == "tar":
-            found = _iter_tar(path, arc)
-            openers[path.name] = ("tar", path)
+            found = _iter_tar(path, label, arc)
         else:
-            found = _iter_dir(path, arc)
-            openers[path.name] = ("dir", path)
+            found = _iter_dir(path, label, arc)
+        openers[label] = (kind, path)
         entries.extend(found)
         archives.append(arc)
     return entries, archives, openers
+
+
+# Exceptions a single corrupt entry can raise while its content is being
+# streamed (bad CRC, truncated stream, missing member, ...). One bad
+# entry must never abort the whole audit — it is exactly the "corrupt or
+# truncated download" case this tool exists to report.
+CONTENT_READ_ERRORS = (
+    OSError, EOFError, RuntimeError, zlib.error,
+    zipfile.BadZipFile, tarfile.TarError,
+)
+
+
+def _mark_unreadable(report: Report, entry: Entry, exc: Exception) -> None:
+    """Record a content-read failure as a problem on the entry's source
+    (unless that source already carries a problem)."""
+    for arc in report.archives:
+        if arc.source == entry.source:
+            if arc.ok:
+                arc.ok = False
+                arc.error = f"unreadable entry: {entry.path} ({exc})"
+            return
 
 
 # --------------------------------------------------------------------------
@@ -432,11 +475,18 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
         ext = PurePosixPath(e.path).suffix.lower() or "(none)"
         report.extensions[ext] = report.extensions.get(ext, 0) + 1
 
+    report.empty = report.total_files == 0
+
     # Mail deep check: count messages in every .mbox in the set. The
-    # content is streamed line by line; nothing is stored.
+    # content is streamed line by line; nothing is stored. An unreadable
+    # (corrupt) mbox is reported as an archive problem, never a crash.
     for e in entries:
         if e.path.lower().endswith(".mbox"):
-            count = count_mbox_messages(e, openers)
+            try:
+                count = count_mbox_messages(e, openers)
+            except CONTENT_READ_ERRORS as exc:
+                _mark_unreadable(report, e, exc)
+                continue
             report.mail_mbox_files.append(
                 {"source": e.source, "path": e.path, "messages": count}
             )
@@ -454,7 +504,12 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
             continue
         by_key: dict[str, list[Entry]] = {}
         for e in group:
-            by_key.setdefault(content_key(e, openers, mode), []).append(e)
+            try:
+                key = content_key(e, openers, mode)
+            except CONTENT_READ_ERRORS as exc:
+                _mark_unreadable(report, e, exc)
+                continue
+            by_key.setdefault(key, []).append(e)
         for _key, copies in by_key.items():
             if len(copies) < 2:
                 continue
@@ -489,22 +544,28 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
                     break
             if not found:
                 report.photos_missing_sidecar.append(f"{e.source}:{e.path}")
+    # Index media names per folder once. Scanning every media path for
+    # every sidecar is O(media x sidecars) path parsing — a 3,000-photo
+    # set took minutes; real Takeout sets are far larger.
+    media_by_folder: dict[str, set[str]] = {}
+    trunc_prefix_by_folder: dict[str, set[str]] = {}
+    trunc_stem_len = SIDECAR_MAX_BASENAME - len(SIDECAR_SUFFIX)
+    for mp in media_paths:
+        ppath = PurePosixPath(mp)
+        mfolder = str(ppath.parent)
+        media_by_folder.setdefault(mfolder, set()).add(ppath.name)
+        trunc_prefix_by_folder.setdefault(mfolder, set()).add(
+            (ppath.name + SIDECAR_SUFFIX)[:trunc_stem_len]
+        )
     for e in photos:
         if not e.name.lower().endswith(SIDECAR_SUFFIX):
             continue
         folder = str(PurePosixPath(e.path).parent)
         stem = e.name[: -len(SIDECAR_SUFFIX)]
-        paired = False
-        for mp in media_paths:
-            if str(PurePosixPath(mp).parent) != folder:
-                continue
-            mname = PurePosixPath(mp).name
-            if stem == mname or (
-                len(stem) == SIDECAR_MAX_BASENAME - len(SIDECAR_SUFFIX)
-                and (mname + SIDECAR_SUFFIX).startswith(stem)
-            ):
-                paired = True
-                break
+        paired = stem in media_by_folder.get(folder, set()) or (
+            len(stem) == trunc_stem_len
+            and stem in trunc_prefix_by_folder.get(folder, set())
+        )
         if not paired:
             report.photos_orphan_sidecars.append(f"{e.source}:{e.path}")
 
@@ -516,6 +577,8 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
 # --------------------------------------------------------------------------
 
 def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> dict:
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"output path exists and is not a directory: {output}")
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -523,25 +586,40 @@ def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> di
     mode = "sha256" if sha256 else "crc32"
     seen: dict[str, str] = {}
     written, skipped = [], []
+    read_problems: list[dict] = []
     for e in entries:
         rel = PurePosixPath(e.path)
         if rel.is_absolute() or ".." in rel.parts:
             skipped.append({"path": e.path, "reason": "unsafe path, skipped"})
             continue
-        key = content_key(e, openers, mode)
-        if key in seen:
-            skipped.append({"path": e.path, "duplicate_of": seen[key]})
-            continue
-        parts = rel.parts
-        if "Takeout" in parts:
-            rel = PurePosixPath(*parts[parts.index("Takeout") + 1:])
-            if not rel.parts:
+        dest = None
+        try:
+            key = content_key(e, openers, mode)
+            if key in seen:
+                skipped.append({"path": e.path, "duplicate_of": seen[key]})
                 continue
-        dest = output.joinpath(*rel.parts)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(dest, "wb") as out:
-            for chunk in _entry_chunks(e, openers):
-                out.write(chunk)
+            parts = rel.parts
+            if "Takeout" in parts:
+                rel = PurePosixPath(*parts[parts.index("Takeout") + 1:])
+                if not rel.parts:
+                    continue
+            dest = output.joinpath(*rel.parts)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as out:
+                for chunk in _entry_chunks(e, openers):
+                    out.write(chunk)
+        except CONTENT_READ_ERRORS as exc:
+            # Corrupt entry: never leave a partial file behind, and make
+            # the skip visible in the log instead of crashing mid-extract.
+            if dest is not None:
+                dest.unlink(missing_ok=True)
+            skipped.append(
+                {"path": e.path, "reason": f"unreadable entry, skipped ({exc})"}
+            )
+            read_problems.append(
+                {"source": e.source, "error": f"unreadable entry: {e.path} ({exc})"}
+            )
+            continue
         seen[key] = e.path
         written.append(e.path)
     log = {
@@ -551,7 +629,7 @@ def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> di
         "skipped_duplicates": skipped,
         "archive_problems": [
             {"source": a.source, "error": a.error} for a in archives if not a.ok
-        ],
+        ] + read_problems,
     }
     (output / "_takeout-audit-log.json").write_text(
         json.dumps(log, indent=2), encoding="utf-8"
@@ -697,6 +775,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        # Documented contract: I/O errors are exit 2, not a traceback
+        # (e.g. --json pointing into a directory that does not exist).
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
