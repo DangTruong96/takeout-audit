@@ -40,7 +40,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 MEDIA_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".bmp",
@@ -503,6 +503,19 @@ def _sidecar_candidates(media_name: str) -> list[str]:
     candidates = [full]
     if len(full) > SIDECAR_MAX_BASENAME:
         candidates.append(full[:SIDECAR_MAX_BASENAME])
+        # The truncated form the orphan check already recognises: the
+        # media name cut to (51 - len(".json")) characters plus the
+        # suffix, for a 51-character sidecar name in total. Without
+        # this candidate a present truncated sidecar was reported as
+        # "missing" for every media name of 47 characters or more,
+        # while the orphan check (correctly) did not flag it as an
+        # orphan — the same file counted as both paired and missing.
+        truncated = (
+            media_name[: SIDECAR_MAX_BASENAME - len(SIDECAR_SUFFIX)]
+            + SIDECAR_SUFFIX
+        )
+        if truncated not in candidates:
+            candidates.append(truncated)
     return candidates
 
 
@@ -661,6 +674,19 @@ def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> di
                          "reason": "path maps to the library root, skipped"}
                     )
                     continue
+            if rel.as_posix() == "_takeout-audit-log.json":
+                # The extract log is written to this exact path at the
+                # end; writing the entry first would let the log
+                # silently overwrite a user file while the log itself
+                # claimed the file was written. Skip it (logged) and
+                # do not mark its content as seen, so a later copy at
+                # a normal path is still extracted.
+                skipped.append(
+                    {"path": e.path,
+                     "reason": "output path is reserved for the extract "
+                               "log, skipped"}
+                )
+                continue
             if rel.as_posix() in written_dests:
                 # A different file already claimed this output path
                 # (archives may repeat a name, and exports get merged).

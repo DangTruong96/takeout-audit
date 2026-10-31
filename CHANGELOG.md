@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] — 2026-10-31
+
+### Fixed
+- Photos sidecar pairing missed the truncated sidecar form for media
+  names of 47 characters or more: a present sidecar named
+  `<first 46 characters>.json` (51 characters in total) was reported
+  as "missing sidecar" even though the orphan check correctly did not
+  flag it as an orphan — the same file counted as both paired and
+  missing. The missing-sidecar check now recognises the truncated
+  form alongside the full name.
+- `extract` silently destroyed a user file whose output path was
+  `_takeout-audit-log.json` at the library root: the entry was written
+  and listed as written, then the extract log overwrote it with the
+  log JSON. Such an entry is now skipped with the reason recorded in
+  the log (without poisoning duplicate detection, so a later copy of
+  the same content at a normal path is still extracted); a
+  same-named file inside a subfolder is unaffected and still written.
+
+### Tests
+- Three new regression tests (truncated sidecar pairing across media
+  name lengths, reserved log filename skip + log survival, subfolder
+  log-name file still written). Suite is now 39 tests.
+
 ## [0.2.2] — 2026-10-23
 
 ### Fixed

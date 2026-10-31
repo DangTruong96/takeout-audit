@@ -182,7 +182,7 @@ class MailCounts(unittest.TestCase):
         data = ta.audit_sources([arc]).to_dict()
         self.assertEqual(data["mail"]["total_messages"], 3)
         self.assertEqual(len(data["mail"]["mbox_files"]), 1)
-        self.assertEqual(data["version"], "0.2.2")
+        self.assertEqual(data["version"], "0.2.3")
 
 
 class CliSmoke(unittest.TestCase):
@@ -434,6 +434,69 @@ class SidecarPairingAtScale(unittest.TestCase):
             self.assertEqual(report.photos_media, n + 1)
             self.assertEqual(len(report.photos_missing_sidecar), 1)
             self.assertEqual(len(report.photos_orphan_sidecars), 1)
+
+
+class TruncatedSidecarAndReservedLogName(unittest.TestCase):
+    """Regression (v0.2.3): the missing-sidecar check must recognise the
+    truncated sidecar form the orphan check already accepts, and extract
+    must not let a user file be overwritten by the extract log."""
+
+    def test_truncated_sidecar_pairs_for_long_media_names(self):
+        for total_len in (47, 51, 60, 70):
+            with self.subTest(total_len=total_len):
+                with tempfile.TemporaryDirectory() as tmp:
+                    name = "B" * (total_len - 4) + ".jpg"
+                    assert len(name) == total_len
+                    arc = Path(tmp) / "long.zip"
+                    write_zip(arc, {
+                        f"Takeout/Google Photos/{name}": PHOTO,
+                        f"Takeout/Google Photos/{name[:46]}.json": SIDECAR,
+                    })
+                    report = ta.audit_sources([arc])
+                    self.assertEqual(report.photos_missing_sidecar, [])
+                    self.assertEqual(report.photos_orphan_sidecars, [])
+
+    def test_extract_skips_reserved_log_filename_and_keeps_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            arc = tmp / "collide.zip"
+            write_zip(arc, {
+                "Takeout/_takeout-audit-log.json": b"USER-DATA-KEEP-ME",
+                "Takeout/Drive/keep.txt": b"USER-DATA-KEEP-ME",
+                "Takeout/Drive/other.txt": b"other",
+            })
+            out = tmp / "library"
+            log = ta.extract_sources([arc], out)
+            self.assertNotIn("Takeout/_takeout-audit-log.json", log["written"])
+            self.assertTrue(any(
+                s["path"] == "Takeout/_takeout-audit-log.json"
+                and "reserved" in s.get("reason", "")
+                for s in log["skipped_duplicates"]
+            ))
+            # The later same-content copy at a normal path is still
+            # extracted (the reserved skip must not poison dedupe),
+            # and the file on disk at the log path is the log itself.
+            self.assertIn("Takeout/Drive/keep.txt", log["written"])
+            self.assertEqual((out / "Drive" / "keep.txt").read_bytes(),
+                             b"USER-DATA-KEEP-ME")
+            on_disk = json.loads(
+                (out / "_takeout-audit-log.json").read_text())
+            self.assertEqual(on_disk["version"], "0.2.3")
+
+    def test_extract_subfolder_log_name_still_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            arc = tmp / "sub.zip"
+            write_zip(arc, {
+                "Takeout/Drive/_takeout-audit-log.json": b"KEEP-SUB",
+            })
+            out = tmp / "library"
+            log = ta.extract_sources([arc], out)
+            self.assertIn("Takeout/Drive/_takeout-audit-log.json",
+                          log["written"])
+            self.assertEqual(
+                (out / "Drive" / "_takeout-audit-log.json").read_bytes(),
+                b"KEEP-SUB")
 
 
 if __name__ == "__main__":
