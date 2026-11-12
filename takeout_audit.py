@@ -40,7 +40,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 MEDIA_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".bmp",
@@ -329,7 +329,7 @@ def load_sources(paths: list[Path]):
             found = _iter_tar(path, label, arc)
         else:
             found = _iter_dir(path, label, arc)
-        openers[label] = (kind, path)
+        openers[label] = _SourceReader(kind, path)
         entries.extend(found)
         archives.append(arc)
     return entries, archives, openers
@@ -372,10 +372,48 @@ def _stream_hash(read_chunks, mode: str) -> str:
     return "crc32:%08x" % (crc & 0xFFFFFFFF)
 
 
-def _entry_chunks(entry: Entry, openers):
-    kind, base = openers[entry.source]
-    if kind == "zip":
-        with zipfile.ZipFile(base) as zf:
+class _SourceReader:
+    """One open handle per source archive, reused for every content
+    read of a single audit/extract run.
+
+    Opening an archive is O(archive): ZipFile.__init__ parses the
+    whole central directory, and TarFile.getmembers() scans the whole
+    member list (for .tar.gz that means decompressing the entire
+    stream). Re-opening per entry therefore made every content read
+    O(archive), so any job that reads many entries — audit --sha256,
+    mbox counting, extract — scaled quadratically with the entry
+    count. One handle per source keeps those jobs linear in archive
+    size. Handles are closed by audit_sources/extract_sources when
+    the run ends (and best-effort by __del__ for direct users of
+    load_sources).
+    """
+
+    def __init__(self, kind: str, base: Path):
+        self.kind = kind
+        self.base = base
+        self._zf = None
+        self._tf = None
+        self._members = None
+
+    def zipfile(self):
+        if self._zf is None:
+            self._zf = zipfile.ZipFile(self.base)
+        return self._zf
+
+    def tarfile(self):
+        if self._tf is None:
+            self._tf = tarfile.open(self.base, "r:*")
+        return self._tf
+
+    def members(self):
+        """Tar member list, in archive order (cached)."""
+        if self._members is None:
+            self._members = self.tarfile().getmembers()
+        return self._members
+
+    def chunks(self, entry: Entry):
+        if self.kind == "zip":
+            zf = self.zipfile()
             # Address the exact member by position: a zip may legally
             # hold several entries with the same name, and opening by
             # name silently returns the last one for all of them.
@@ -389,12 +427,12 @@ def _entry_chunks(entry: Entry, openers):
                     if not chunk:
                         break
                     yield chunk
-    elif kind == "tar":
-        with tarfile.open(base, "r:*") as tf:
+        elif self.kind == "tar":
+            tf = self.tarfile()
             # Same duplicate-name hazard as zip: getmember() returns
             # one match, so address the member by position instead.
             member = (
-                tf.getmembers()[entry.index]
+                self.members()[entry.index]
                 if entry.index is not None else tf.getmember(entry.path)
             )
             fh = tf.extractfile(member)
@@ -402,18 +440,44 @@ def _entry_chunks(entry: Entry, openers):
                 raise tarfile.TarError(
                     f"entry has no readable content: {entry.path}"
                 )
-            while True:
-                chunk = fh.read(CHUNK)
-                if not chunk:
-                    break
-                yield chunk
-    else:
-        with open(Path(base) / entry.path, "rb") as fh:
-            while True:
-                chunk = fh.read(CHUNK)
-                if not chunk:
-                    break
-                yield chunk
+            try:
+                while True:
+                    chunk = fh.read(CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                fh.close()
+        else:
+            with open(Path(self.base) / entry.path, "rb") as fh:
+                while True:
+                    chunk = fh.read(CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+
+    def close(self) -> None:
+        if self._zf is not None:
+            self._zf.close()
+            self._zf = None
+        if self._tf is not None:
+            self._tf.close()
+            self._tf = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _close_openers(openers) -> None:
+    for reader in openers.values():
+        reader.close()
+
+
+def _entry_chunks(entry: Entry, openers):
+    yield from openers[entry.source].chunks(entry)
 
 
 def content_key(entry: Entry, openers, mode: str) -> str:
@@ -426,45 +490,165 @@ def content_key(entry: Entry, openers, mode: str) -> str:
     return f"{entry.size}:{entry.digest}"
 
 
-def count_mbox_messages(entry: Entry, openers) -> int:
-    """Count messages in an mbox entry. In mbox format every message is
-    introduced by a separator line beginning with ``From ``; body lines
-    that would look like separators are escaped as ``>From `` by the
-    writer, so a plain prefix count is the standard heuristic.
+class _MboxCounter:
+    """Streaming ``From `` separator counter.
 
-    The scan is a small state machine over the raw chunks — O(n) time
-    and O(chunk) memory regardless of line lengths. Splitting the
-    stream into lines first (the previous implementation) copies the
-    remaining buffer for every line, which is quadratic: a plain
-    30 MB mbox took over a minute, and a file with very long lines
-    degraded just as badly.
+    The scan is a small state machine over raw chunks — O(n) time and
+    O(chunk) memory regardless of line lengths. ``feed`` may be called
+    with any chunking: a separator split across chunk boundaries is
+    still counted exactly once.
     """
-    separator = b"From "
-    count = 0
-    pending = b""      # partial separator candidate at a line start
-    at_line_start = True
-    for chunk in _entry_chunks(entry, openers):
-        data = pending + chunk
-        pending = b""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._pending = b""      # partial separator candidate at a line start
+        self._at_line_start = True
+
+    def feed(self, chunk: bytes) -> None:
+        separator = b"From "
+        data = self._pending + chunk
+        self._pending = b""
         pos = 0
         end = len(data)
         while pos < end:
-            if at_line_start:
+            if self._at_line_start:
                 if end - pos < len(separator):
                     # Too few bytes left to decide: carry them over.
-                    pending = data[pos:]
+                    self._pending = data[pos:]
                     pos = end
                     break
                 if data.startswith(separator, pos):
-                    count += 1
-                at_line_start = False
+                    self.count += 1
+                self._at_line_start = False
             newline = data.find(b"\n", pos)
             if newline < 0:
                 pos = end
             else:
                 pos = newline + 1
-                at_line_start = True
-    return count
+                self._at_line_start = True
+
+
+def count_mbox_messages(entry: Entry, openers) -> int:
+    """Count messages in an mbox entry. In mbox format every message is
+    introduced by a separator line beginning with ``From ``; body lines
+    that would look like separators are escaped as ``>From `` by the
+    writer, so a plain prefix count is the standard heuristic.
+    """
+    counter = _MboxCounter()
+    for chunk in _entry_chunks(entry, openers):
+        counter.feed(chunk)
+    return counter.count
+
+
+def _prefetch_tar(entries, openers, mode: str, *, hash_all=False,
+                  count_mbox=True):
+    """One ordered streaming pass over each tar source, computing
+    content digests and mbox message counts.
+
+    A tar archive cannot seek cheaply — for .tar.gz, seeking backwards
+    means decompressing from the start again — so reading members one
+    by one in whatever order the caller wants costs a full scan (and
+    for gzip, a full decompression) per member. The dedupe pass reads
+    members in size order, not archive order, so without this the
+    audit of a tar set is quadratic in the entry count. This pass
+    walks each tar archive once, in archive order, and for every
+    member the caller will need it hashes the content (stored on the
+    entry, so content_key() finds it already computed) and/or counts
+    its mbox messages (returned keyed by (source, index)) — each
+    member's bytes are read exactly once, feeding the hash and the
+    counter from the same chunks.
+
+    The pass is purely an optimisation and must run before any lazy
+    content read of the same sources. Anything it cannot read is left
+    untouched: the normal lazy path then reads (and reports) it
+    exactly as before.
+    """
+    if hash_all:
+        need_hash = {
+            (e.source, e.index) for e in entries
+            if e.kind == "tar" and e.size > 0
+        }
+    else:
+        # Mirror the audit's dedupe pass: only members of same-size
+        # groups (size > 0, at least 2 members) ever get hashed.
+        by_size: dict[int, list[Entry]] = {}
+        for e in entries:
+            if e.kind == "tar" and e.size > 0:
+                by_size.setdefault(e.size, []).append(e)
+        need_hash = {
+            (e.source, e.index)
+            for group in by_size.values() if len(group) >= 2
+            for e in group
+        }
+    need_mbox = {
+        (e.source, e.index) for e in entries
+        if count_mbox and e.kind == "tar"
+        and e.path.lower().endswith(".mbox")
+    }
+    if not need_hash and not need_mbox:
+        return {}
+    wanted_by_source: dict[str, dict[int, Entry]] = {}
+    for e in entries:
+        if e.kind != "tar":
+            continue
+        key = (e.source, e.index)
+        if key in need_hash or key in need_mbox:
+            wanted_by_source.setdefault(e.source, {})[e.index] = e
+    mbox_counts: dict = {}
+    for label, wanted in wanted_by_source.items():
+        reader = openers[label]
+        try:
+            tf = reader.tarfile()
+        except (tarfile.TarError, EOFError, OSError):
+            continue
+        try:
+            for idx, member in enumerate(tf):
+                entry = wanted.get(idx)
+                if entry is None or not member.isfile():
+                    continue
+                key = (entry.source, idx)
+                want_digest = key in need_hash
+                try:
+                    fh = tf.extractfile(member)
+                    if fh is None:
+                        continue
+                    counter = (
+                        _MboxCounter() if key in need_mbox else None
+                    )
+                    crc = 0
+                    sha = (
+                        hashlib.sha256()
+                        if want_digest and mode == "sha256" else None
+                    )
+                    while True:
+                        chunk = fh.read(CHUNK)
+                        if not chunk:
+                            break
+                        if want_digest:
+                            if sha is not None:
+                                sha.update(chunk)
+                            else:
+                                crc = zlib.crc32(chunk, crc)
+                        if counter is not None:
+                            counter.feed(chunk)
+                    fh.close()
+                except CONTENT_READ_ERRORS:
+                    # Leave the entry for the lazy path, which reports
+                    # it exactly as before.
+                    continue
+                if want_digest:
+                    entry.digest = (
+                        "sha256:" + sha.hexdigest()
+                        if sha is not None
+                        else "crc32:%08x" % (crc & 0xFFFFFFFF)
+                    )
+                if counter is not None:
+                    mbox_counts[key] = counter.count
+        except (tarfile.TarError, EOFError, OSError, zlib.error):
+            # Truncated mid-iteration: remaining entries fall back to
+            # the lazy path, which reports them as before.
+            continue
+    return mbox_counts
 
 
 # --------------------------------------------------------------------------
@@ -521,6 +705,13 @@ def _sidecar_candidates(media_name: str) -> list[str]:
 
 def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
     entries, archives, openers = load_sources(paths)
+    try:
+        return _audit_loaded(entries, archives, openers, paths, sha256)
+    finally:
+        _close_openers(openers)
+
+
+def _audit_loaded(entries, archives, openers, paths, sha256) -> Report:
     report = Report(
         sources=[str(p) for p in paths],
         archives=archives,
@@ -539,16 +730,28 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
 
     report.empty = report.total_files == 0
 
+    # Tar content prefetch: one ordered pass per tar archive hashes
+    # the members the dedupe pass will need and counts every .mbox,
+    # so the lazy per-entry reads below never fire for tar sources.
+    mode = report.hash_mode
+    tar_mbox_counts = _prefetch_tar(
+        entries, openers, mode, count_mbox=True
+    )
+
     # Mail deep check: count messages in every .mbox in the set. The
     # content is streamed line by line; nothing is stored. An unreadable
     # (corrupt) mbox is reported as an archive problem, never a crash.
     for e in entries:
         if e.path.lower().endswith(".mbox"):
-            try:
-                count = count_mbox_messages(e, openers)
-            except CONTENT_READ_ERRORS as exc:
-                _mark_unreadable(report, e, exc)
-                continue
+            key = (e.source, e.index)
+            if e.kind == "tar" and key in tar_mbox_counts:
+                count = tar_mbox_counts[key]
+            else:
+                try:
+                    count = count_mbox_messages(e, openers)
+                except CONTENT_READ_ERRORS as exc:
+                    _mark_unreadable(report, e, exc)
+                    continue
             report.mail_mbox_files.append(
                 {"source": e.source, "path": e.path, "messages": count}
             )
@@ -560,7 +763,6 @@ def audit_sources(paths: list[Path], sha256: bool = False) -> Report:
     for e in entries:
         if e.size > 0:
             by_size.setdefault(e.size, []).append(e)
-    mode = report.hash_mode
     for size, group in sorted(by_size.items()):
         if len(group) < 2:
             continue
@@ -649,7 +851,20 @@ def extract_sources(paths: list[Path], output: Path, sha256: bool = False) -> di
         raise ValueError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
     entries, archives, openers = load_sources(paths)
+    try:
+        return _extract_loaded(
+            entries, archives, openers, output, sha256
+        )
+    finally:
+        _close_openers(openers)
+
+
+def _extract_loaded(entries, archives, openers, output, sha256) -> dict:
     mode = "sha256" if sha256 else "crc32"
+    # Tar content prefetch: hash every tar entry once, in archive
+    # order, so content_key() below never re-reads — the write reads
+    # that follow then stay forward-sequential through each archive.
+    _prefetch_tar(entries, openers, mode, hash_all=True, count_mbox=False)
     seen: dict[str, str] = {}
     written_dests: dict[str, str] = {}   # output-relative path -> entry path
     written, skipped = [], []

@@ -182,7 +182,7 @@ class MailCounts(unittest.TestCase):
         data = ta.audit_sources([arc]).to_dict()
         self.assertEqual(data["mail"]["total_messages"], 3)
         self.assertEqual(len(data["mail"]["mbox_files"]), 1)
-        self.assertEqual(data["version"], "0.2.3")
+        self.assertEqual(data["version"], "0.2.4")
 
 
 class CliSmoke(unittest.TestCase):
@@ -481,7 +481,7 @@ class TruncatedSidecarAndReservedLogName(unittest.TestCase):
                              b"USER-DATA-KEEP-ME")
             on_disk = json.loads(
                 (out / "_takeout-audit-log.json").read_text())
-            self.assertEqual(on_disk["version"], "0.2.3")
+            self.assertEqual(on_disk["version"], "0.2.4")
 
     def test_extract_subfolder_log_name_still_written(self):
         with tempfile.TemporaryDirectory() as tmp:

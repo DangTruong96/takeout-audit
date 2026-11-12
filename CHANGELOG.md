@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.4] — 2026-11-12
+
+### Fixed
+- Content reads scaled quadratically with the entry count: every
+  content read re-opened its archive and re-read the whole member
+  index (`ZipFile()` parses the full central directory per read;
+  `tarfile.open()` + `getmembers()` re-scans the member list, and
+  for `.tar.gz` fully re-decompresses the stream, per read). Any job
+  that reads many entries — `audit --sha256`, mbox counting, `extract`
+  — was therefore O(entries × archive). Measured on this VM:
+  auditing 1,000 same-size files in a `.tar.gz` took ~92 s (now
+  ~1 s at 3,000 files), and extracting 3,000 files from a `.zip`
+  took ~39 s (now ~0.9 s).
+  Each source archive is now opened once per run (one handle reused
+  for all reads), and tar sources get a single ordered streaming pass
+  that hashes the members dedupe will need and counts every `.mbox`,
+  so tar reads never seek backwards through a gzip stream.
+- A truncated tar archive lost all of its readable content from the
+  report: every content read re-ran `getmembers()` over the truncated
+  member list and failed, so mail counts read 0 and no duplicates
+  were found even though the archive's readable members were fine
+  (the truncation itself was still flagged). Readable members are
+  now still counted and deduped; only the truncated member itself
+  drops out of its duplicate group.
+
+### Tests
+- Seven new regression tests (handle/member-list reuse for zip and
+  tar, prefetch serving all tar content reads in `audit` and
+  `extract`, tar.gz/zip agreement, truncated-tar fallback, zip
+  extract opening the archive once). Suite is now 46 tests.
+
 ## [0.2.3] — 2026-10-31
 
 ### Fixed
